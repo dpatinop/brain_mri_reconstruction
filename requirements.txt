@@ -1,0 +1,14 @@
+deepbrain
+matplotlib
+nibabel
+notebook
+pandas
+Pillow
+pydicom==2.3.1
+scikit-image
+scikit-learn
+tensorflow==2.10.1
+keras==2.10.0
+tensorflow-addons==0.18.0
+tensorflow-datasets==4.8.0
+tensorflow-io==0.27.0
