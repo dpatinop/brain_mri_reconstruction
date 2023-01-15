@@ -9,7 +9,7 @@ import tensorflow as tf
 import tensorflow_addons as tfa
 import tensorflow_io as tfio
 
-def datasetSplit(slicesGlob='slices_dicom/sagittal/*.dcm', seed=None):
+def datasetSplit(slicesGlob='slices_dicom/sagittal/*.dcm', seed=None, drop_duplicates=False):
     volumeFiles = dict()
     for file in glob('dataset/IXI-T1/*.gz'):
         index = int(re.match(r"IXI([0-9]+)-.*", os.path.basename(file))[1])
@@ -17,6 +17,8 @@ def datasetSplit(slicesGlob='slices_dicom/sagittal/*.dcm', seed=None):
     volumeFiles = pd.DataFrame.from_dict(volumeFiles, orient='index', columns=['volume'])
 
     data = pd.read_excel('dataset/IXI.xls', index_col='IXI_ID')
+    if drop_duplicates:
+        data.drop_duplicates(inplace=True)
     data['volume'] = volumeFiles['volume']
     data = data[data['volume'].notnull()][["SEX_ID (1=m, 2=f)", "AGE", 'volume']]
 
@@ -34,73 +36,77 @@ def datasetSplit(slicesGlob='slices_dicom/sagittal/*.dcm', seed=None):
         index = int(re.match(r"IXI([0-9]+)-.*", os.path.basename(file))[1])
         if index in train.index:
             train_files.append(file)
-        if index in validation.index:
+        elif index in validation.index:
             validation_files.append(file)
-        if index in test.index:
+        elif index in test.index:
             test_files.append(file)
 
     return train_files, validation_files, test_files
 
-def augmentImage(image, label):
+@tf.function
+def augmentImage(image, label, cutoutRate=0.3):
     with tf.device('/CPU:0'):
-        #Noise and Dropout
-        doDropout = tf.random.uniform(shape=[], minval=0, maxval=1)
-        if doDropout < 0.3:
-            dropoutRate = tf.random.uniform(shape=[], minval=0, maxval=0.04)
-            image = tf.nn.dropout(image, dropoutRate)
+        rnd = tf.random.uniform(shape=[4], minval=0, maxval=1)
+        dropout_noise = tf.random.uniform(shape=[2], minval=0, maxval=0.04)
 
-        doNoise = tf.random.uniform(shape=[], minval=0, maxval=1)
-        if doNoise < 0.3:
-            noise = tf.random.uniform(shape=[], minval=0, maxval=0.04)
-            image = tf.keras.layers.GaussianNoise(noise)(image, training=True)
+        # Dropout
+        if rnd[0] < 0.3:
+            image = tf.nn.dropout(image, dropout_noise[0])
 
-        #Blankout and blur
-        doCutout = tf.random.uniform(shape=[], minval=0, maxval=1)
-        if doCutout < 0.3:
-            minx = int(128 * 0.04 / 2)
-            miny = int(128 * 0.04 / 2)
-            maxx = int(128 * 0.24 / 2)
-            maxy = int(128 * 0.24 / 2)
+        # Noise
+        if rnd[1] < 0.3:
+            image = tf.keras.layers.GaussianNoise(dropout_noise[1])(image, training=True)
 
-            sizex = tf.math.scalar_mul(2, tf.random.uniform(shape=[], minval=minx, maxval=maxx, dtype=tf.dtypes.int32))
-            sizey = tf.math.scalar_mul(2, tf.random.uniform(shape=[], minval=miny, maxval=maxy, dtype=tf.dtypes.int32))
-            fill = tf.random.uniform(shape=[], minval=0, maxval=1)
+        # Blankout, enable enforced cuts if rate is higher than 1.0
+        while rnd[2] < cutoutRate:
+            mask_size = tf.math.scalar_mul(2, tf.random.uniform(shape=[2], minval=5, maxval=20, dtype=tf.dtypes.int32))
+            image = tfa.image.random_cutout(image, mask_size=mask_size, constant_values=0)
+            cutoutRate -= 1
 
-            image = tfa.image.random_cutout(image, mask_size=(sizex, sizey), constant_values=fill)
-
-        doBlur = tf.random.uniform(shape=[], minval=0, maxval=1)
-        if doBlur < 0.3:
+        # Blur
+        if rnd[3] < 0.3:
             image = tfa.image.gaussian_filter2d(image, filter_shape=[3, 3], sigma=0.6, constant_values=0)
 
     return image, label
 
+@tf.function
 def getImage(file_path: tf.Tensor, input_size, output_size):
     with tf.device('/CPU:0'):
         image = tf.io.read_file(file_path)
         image = tfio.image.decode_dicom_image(image, color_dim=True, on_error='strict', dtype=tf.float32)[0]
         image /= (2**32 - 1)
 
-        label = tf.image.resize(image, size=output_size)
-        image = tf.image.resize(image, size=input_size)
+        # First resize output image if expected size is different from original image
+        if output_size[0] == 256 and output_size[1] == 256:
+            label = tf.identity(image)
+        else:
+            label = tf.image.resize(image, size=output_size)
+
+        # Then resize input image if expecte size is different from output
+        if output_size[0] == input_size[0] and output_size[1] == input_size[1]:
+            image = tf.identity(label)
+        else:
+            image = tf.image.resize(image, size=input_size)
 
     return image, label
 
-def createDataset(fileList, batch_size, input_size=(128, 128), output_size=(128, 128), seed=None, shuffle=False, augment=False, buffer_size=None, sample=None):
-    with tf.device('/CPU:0'):
-        if seed != None:
-            tf.random.set_seed(seed)
+def createDataset(fileList, batch_size, input_size=(128, 128), output_size=(128, 128), seed=None, shuffle=False, augment=False, buffer_size=None, sample=None, cutoutRate=0.3):
+    if seed != None:
+        tf.random.set_seed(seed)
+    if sample != None:
+        fileList = random.sample(fileList, sample)
+    if buffer_size == None:
+        buffer_size = len(fileList)
 
-        if sample != None:
-            fileList = random.sample(fileList, sample)
+    with tf.device('/CPU:0'):
         ds = tf.data.Dataset.from_tensor_slices(fileList)
         ds = ds.map(lambda x: tf.py_function(func=getImage, inp=[x, input_size, output_size], Tout=(tf.float32, tf.float32)), num_parallel_calls=tf.data.AUTOTUNE)
-        ds = ds.cache()
-        if buffer_size == None:
-            buffer_size = len(fileList)
+        ds = ds.cache(filename='cache/' + str(hash(str(fileList) + str(input_size) + str(output_size))))
+
         if shuffle:
             ds = ds.shuffle(buffer_size=buffer_size, reshuffle_each_iteration=True)
         ds = ds.batch(batch_size)
         if augment:
-            ds = ds.map(lambda image, label: tf.py_function(func=augmentImage, inp=[image, label], Tout=(tf.float32, tf.float32)), num_parallel_calls=tf.data.AUTOTUNE)
+            ds = ds.map(lambda image, label: tf.py_function(func=augmentImage, inp=[image, label, cutoutRate], Tout=(tf.float32, tf.float32)), num_parallel_calls=1)
         ds = ds.prefetch(buffer_size=tf.data.AUTOTUNE)
     return ds
