@@ -1,3 +1,6 @@
+* DatasetExploration.ipynb
+Notebook exploring the IXI dataset
+
 * SliceVolumes.ipynb
 Notebook with code to extract the slices from the NIfTI volumes
 
